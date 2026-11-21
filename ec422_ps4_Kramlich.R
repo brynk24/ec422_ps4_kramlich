@@ -1,0 +1,245 @@
+library(tidyverse)
+library(fpp3)
+library(BVAR)
+
+liquor_raw <- read_csv(
+  "data/MRTSSM4453USN.csv",
+  na = ".",
+  col_types = cols(
+    observation_date = col_date(format = "%Y-%m-%d"),
+    MRTSSM4453USN = col_double()
+  )
+)
+
+liquor <- liquor_raw |>
+  transmute(Month = yearmonth(observation_date), sales = MRTSSM4453USN) |>
+  as_tsibble(index = Month) |>
+  filter(Month <= yearmonth("2019 Dec"))
+
+has_gaps(liquor)
+
+# 2.1b - Plot monthly liquor store sales
+
+liquor |>
+  autoplot(sales) +
+  labs(
+    title = "U.S. Beer, Wine, and Liquor Store Sales",
+    x = "Year",
+    y = "Monthly Sales (Millions of Dollars)"
+  )
+
+# 2.1b - Seasonal plot of log sales
+
+liquor |>
+  gg_season(log(sales)) +
+  labs(
+    title = "Seasonal Pattern of U.S. Liquor Store Sales",
+    x = "Month",
+    y = "Log of Monthly Sales"
+  )
+
+# liquor store sales show an upwards trend with seasonlality. The graph displays that sales are highest in December and lowest in January and February. Seasonal swings grow as sales increase, suggesting that using logs would help stabilize the variation over time.
+
+# 2.2 - Fit Both Models
+liquor_fit <- liquor |>
+  model(arima = ARIMA(log(sales)),
+        ets   = ETS(log(sales)))
+
+liquor_fit |> select(arima) |> report()
+liquor_fit |> select(ets) |> report()
+
+#the given ARIMA model means the series uses one seasonal difference and no regular differencing. The selected ETS model is A,A,A, meaning additive error, additive trend, and additive seasonality.
+
+liquor_fit |>
+  select(arima) |>
+  gg_tsresiduals()
+
+liquor_fit |>
+  select(arima) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 24, dof = 6)
+# The ARIMA model does not appear to be white noise becuase the p-value is near 0, which is below 0.05. The ACF plot also shows  autocorrelation at several lags, suggesting the model has not captured all the patterns in the data.
+
+# 2.3 - Horse Race
+liquor_cv <- liquor |>
+  stretch_tsibble(.init = 120, .step = 1) |>
+  filter(.id < max(.id))
+
+liquor_cv_fit <- liquor_cv |>
+  model(snaive = SNAIVE(sales),
+        ets = ETS(log(sales)),
+        arima = ARIMA(log(sales)))
+
+saveRDS(liquor_cv_fit, "results/liquor_cv_fit.rds")
+
+liquor_cv_fc <- liquor_cv_fit |>
+  forecast(h = 1)
+
+liquor_cv_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE)) |>
+  knitr::kable(digits = 2)
+# the first forecast is January 2002 and the last is December 2019. ARIMA performs the best with a RMSE of 81.43 and MAE of 65.65. Again, ARIMA is the most accurate model, followed by ETS and SNAIVE.
+
+# 2.4 - Diebold-Mariano Test
+
+liquor_errs <- liquor_cv_fc |>
+  as_tibble() |>
+  left_join(as_tibble(liquor) |> select(Month, actual = sales),
+            by = "Month") |>
+  mutate(e = actual - .mean) |>
+  select(Month, .model, e) |>
+  pivot_wider(names_from = .model, values_from = e)
+
+forecast::dm.test(liquor_errs$arima, liquor_errs$ets,
+                  h = 1, power = 2)
+forecast::dm.test(liquor_errs$arima, liquor_errs$snaive,
+                  h = 1, power = 2)
+# the tests show that ARIMA is more accurate than ETS with a DM = -2.9062 abnd p = 0.004042. and SNAIVE DM = -10.755 with p < 2.2e-16.Both p-values are below 0.05, meaning the differences are statistically significant. I would choose ARIMA for the liquor store chain because it has the lowest forecasting errors.
+
+# Part 3a - Forecast Combination
+
+liquor_combo_fc <- liquor_cv_fit |>
+  mutate(combo = (arima + ets) / 2) |>
+  forecast(h = 1)
+
+liquor_combo_fc |>
+  accuracy(liquor, measures = list(RMSE = RMSE, MAE = MAE)) |>
+  knitr::kable(digits = 2)
+# the combined model performs better than ETS but worse than ARIMA. RIMA remains the most accurate model, with the lowest RMSE and MAE. in conclusion, combining the two models did not improve forecasting accuracy over ARIMA alone.
+
+# Part 3b - Error Correlation
+
+cor(liquor_errs$arima, liquor_errs$ets)
+# The correlation of ARIMA and ETS forecast errors is 0.8783. the forecast erros indicates the models make very similar errors. The DM test also showed that ARIMA was significantly more accurate than ETS. Because their errors are highly correlated, combining provides little benefit and does not outperform ARIMA by itself.
+
+#4.1a 
+qd_raw <- read_csv("data/fredqd_2026-09.csv",
+                   show_col_types = FALSE) |>
+  slice(-(1:2))
+
+#4.1b
+growth <- function(x) 100 * difference(log(x))
+
+qd <- qd_raw |>
+  mutate(date = as.Date(sasdate, "%m/%d/%Y")) |>
+  transmute(date,
+            gdp    = growth(GDPC1),     # real GDP
+            cons   = growth(PCECC96),   # real consumption
+            inv    = growth(GPDIC1),    # real investment
+            emp    = growth(PAYEMS),    # payroll employment
+            infl   = growth(GDPCTPI),   # GDP price index
+            unrate = difference(UNRATE),     # unemployment rate
+            ffr    = difference(FEDFUNDS),   # federal funds rate
+            gs10   = difference(GS10)) |>    # 10-year Treasury yield
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+y <- qd |> select(-date) |> as.matrix()
+
+nrow(y)
+head(y)
+
+#4.1c
+N <- nrow(y)
+origins <- 120:(N - 1)
+actual <- y[121:N, ]
+
+# We will produce 120 forecasts per variable beginning in the beggining of 1990 and ending in the end of 2019.
+
+# Part 4.2 - OLS VARs
+
+var_ols_fc <- function(z, p) {
+  e <- embed(z, p + 1)
+  M <- ncol(z)
+  B <- coef(lm(e[, 1:M] ~ e[, -(1:M)]))
+  x <- c(1, t(z[nrow(z):(nrow(z) - p + 1), ]))
+  x %*% B
+}
+
+fc_var1 <- NULL
+fc_var4 <- NULL
+
+for (T in origins) {
+  fc_var1 <- rbind(fc_var1, var_ols_fc(y[1:T, ], 1))
+  fc_var4 <- rbind(fc_var4, var_ols_fc(y[1:T, ], 4))
+}
+
+rmse_by_var <- function(f) sqrt(colMeans((actual - f)^2))
+
+rmse_by_var(fc_var1)
+rmse_by_var(fc_var4)
+
+#var1 forecasts more accurately than var4 for all variables except for inflation. i suppose that var 1 premores better as a smaller model becuase it estimates less coeffiecients compared to var 4 which results in increasing risk of overfitting and accuracy in forecasting. 
+
+# 4.3 - ABVAR
+#4.3a 
+bvar_cv <- function(lambda) {
+  pr <- bv_priors(hyper = "lambda",
+                  mn = bv_mn(lambda = bv_lambda(mode = lambda, sd = 0.4,
+                                                min = 0.999 * lambda,
+                                                max = 1.001 * lambda),
+                             b = 0))
+  fc <- NULL
+  for (T in origins) {
+    fit_T <- bvar(y[1:T, ], lags = 4, priors = pr,
+                  n_draw = 2000, n_burn = 1000, verbose = FALSE)
+    x <- c(1, t(y[T:(T - 3), ]))         # constant and 4 lags of each variable
+    fc <- rbind(fc, x %*% coef(fit_T))   # forecast of y_{T+1}
+  }
+  fc
+}
+
+set.seed(422)
+fc_bvar_03 <- bvar_cv(0.3)
+saveRDS(fc_bvar_03, "results/fc_bvar_03.rds")
+
+#4.3b
+set.seed(422)
+fc_bvar_005 <- bvar_cv(0.05)
+
+var_results <- tibble(
+  Variable = colnames(y),
+  `VAR(1)` = rmse_by_var(fc_var1),
+  `VAR(4)` = rmse_by_var(fc_var4),
+  `BVAR(4), lambda = 0.3` = rmse_by_var(fc_bvar_03),
+  `BVAR(4), lambda = 0.05` = rmse_by_var(fc_bvar_005)
+)
+
+saveRDS(var_results, "results/var_results.rds")
+
+var_results |> knitr::kable(digits = 3)
+
+#1. BVAR4 preforms better than VAR4 for all 8 variables. likely due because the Minnesota prior shrinks the coefficients, reducing overfitting and improving forecast accuracy.
+#2. VAR1 performs better for 5 of the 8 variables. BVAR4 performs better for investment, inflation, and the Treasury yield.
+#3. Stronger shrinkage makes forecasts worse for this case, but does improve the federal funds rate forecast which suggests that too much shrinkage can reduce forecasting accuracy. No, Choosing the best model based on the same test results can make its RMSE look overly optimistic.
+
+#4.3c
+e_var4 <- actual[, "gdp"] - fc_var4[, 1]
+e_bvar <- actual[, "gdp"] - fc_bvar_03[, 1]
+
+forecast::dm.test(e_var4, e_bvar, h = 1, power = 2)
+
+e_var4_inv <- actual[, "inv"] - fc_var4[, 3]
+e_bvar_inv <- actual[, "inv"] - fc_bvar_03[, 3]
+
+forecast::dm.test(e_var4_inv, e_bvar_inv, h = 1, power = 2)
+
+# The test shows that BVAR 4 is  more accurate than VAR 4 for GDP growth with a DM of 2.1366 and a p of 0.03468.For investment, BVAR4 also has a lower RMSE, but the difference is not statistically significant becuase the DM is 1.6265 with a p of 0.1065.This shows that while BVAR generally improves forecasting accuracy in 4.3b, not all improvements are statistically significant.
+
+#Part 5
+#5.1a
+md_raw <- read_csv("data/fredmd_2026-09.csv", show_col_types = FALSE)
+tcode <- unlist(md_raw[1, -1])
+md <- md_raw[-1, ] |> mutate(date = as.Date(sasdate, "%m/%d/%Y"))
+
+transform_series <- function(x, code) {
+  d <- function(v) c(NA, diff(v))
+  switch(as.character(code),
+         "1" = x,                      # level
+         "2" = d(x),                   # first difference
+         "3" = d(d(x)),                # second difference
+         "4" = log(x),                 # log
+         "5" = 100 * d(log(x)),        # growth rate
+         "6" = 100 * d(d(log(x))),     # change in the growth rate
+         "7" = d(x / dplyr::lag(x) - 1))
+}
+
